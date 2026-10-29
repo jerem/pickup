@@ -5,6 +5,14 @@ under `~/.claude/projects`, newest first, showing each session's title and
 working directory — and lets you resume any of them in a terminal with one
 click, or start a new named session in any directory.
 
+It also lists [pi](https://pi.dev) sessions from `~/.pi/agent/sessions`. Each row
+carries a badge naming its agent, and a switch above the list narrows it to one
+agent when you have sessions from both. They resume with `pi --session <file>`, and renaming one
+appends the same `session_info` entry pi's `/name` writes. Pi has no session
+colour, so the app keeps it in a `custom` entry of its own, which pi leaves out
+of the model's context. The New session dialog offers pi as the agent when it
+is installed.
+
 ![GTK4 / libadwaita]
 
 ## Run
@@ -39,6 +47,8 @@ The sandbox is intentionally narrow:
 - `--filesystem=~/.claude` — read the session logs, and append a `custom-title`
   entry when you rename a session. No access outside `~/.claude` is granted, not
   even read-only.
+- `--filesystem=~/.pi/agent/sessions`: the same for pi sessions. The rest of
+  `~/.pi`, including its `auth.json`, stays out of the sandbox.
 - `--talk-name=org.freedesktop.Flatpak` — the only way to reach the host. The
   app shells out via `flatpak-spawn --host` to launch your terminal, run
   `claude`, `mkdir -p` a new session's location, `xdg-open` a project folder,

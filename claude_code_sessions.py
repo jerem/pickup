@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Claude Code Sessions — a small libadwaita/GTK4 dashboard.
 
-Lists every Claude Code session found under ~/.claude/projects (newest first),
-shows its working directory, and lets you resume it in a terminal — or start a
-new named session in any directory.
+Lists every Claude Code session found under ~/.claude/projects, and every pi
+session under ~/.pi/agent/sessions (newest first), shows its working directory,
+and lets you resume it in a terminal — or start a new named session in any
+directory.
 """
 
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gi
@@ -24,6 +27,17 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
+# Where each agent keeps its logs, as (root, agent). Both lay them out the same
+# way: one directory per project, one .jsonl per session.
+SESSION_ROOTS = ((PROJECTS_DIR, "claude"), (PI_SESSIONS_DIR, "pi"))
+# The entry we append to a pi session to remember its colour. Pi has no colour
+# of its own, and a plain custom entry is kept out of the model's context.
+PI_COLOR_TYPE = "claude-code-sessions:color"
+# The agents a new session can start, as (command, label).
+AGENTS = (("claude", "Claude Code"), ("pi", "pi"))
+# The badge each row carries to say which agent it belongs to: (text, colour).
+AGENT_BADGES = {"claude": ("Claude", "#c15f3c"), "pi": ("pi", "#3584e4")}
 APP_ID = "io.github.jerem.ClaudeCodeSessions"
 # Our own state (starred sessions). Maps to ~/.config outside the sandbox and to
 # ~/.var/app/<id>/config inside it — writable in both cases.
@@ -54,7 +68,12 @@ def session_css():
     it. The width is a balance: too narrow and the corner tapers into a sliver,
     too wide and the bar reads as a block of colour down the list.
     """
-    rules = [".color-swatch { min-width: 22px; min-height: 22px; padding: 0; }"]
+    rules = [".color-swatch { min-width: 22px; min-height: 22px; padding: 0; }",
+             ".agent-badge { font-size: smaller; font-weight: bold;"
+             " padding: 1px 8px; border-radius: 999px; }"]
+    for agent, (_text, value) in AGENT_BADGES.items():
+        rules.append(f".agent-badge.{agent} {{ color: {value};"
+                     f" background-color: alpha({value}, 0.15); }}")
     for name, value in SESSION_COLORS.items():
         rules.append(f"row.session-{name} {{"
                      f" background-image: linear-gradient({value}, {value});"
@@ -163,11 +182,13 @@ class Query:
 # --------------------------------------------------------------------------- #
 class Session:
     __slots__ = ("session_id", "cwd", "title", "mtime", "path", "search_blob",
-                 "color", "_tokens")
+                 "color", "agent", "_tokens")
 
     def __init__(self, session_id, cwd, title, mtime, path, search_blob,
-                 color=None):
+                 color=None, agent="claude"):
         self.session_id = session_id
+        # Which CLI owns the session: "claude" or "pi".
+        self.agent = agent
         self.cwd = cwd
         self.title = title
         self.mtime = mtime
@@ -269,7 +290,55 @@ def _read_into(path, state):
         state["prompts"] = " ".join(x for x in (state["prompts"], *fresh) if x)
 
 
-def parse_session(path, index=None):
+def _json_line(raw):
+    """A JSONL line as a dict, or None if it won't parse into one."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read_pi_into(path, state):
+    """Fold the not-yet-read lines of a pi session into `state`.
+
+    The same incremental byte-level pass as _read_into, over pi's format: the
+    cwd is in the header line, the name is the latest session_info entry (an
+    empty one clears it), and user turns are message entries with role "user".
+    Pi writes compact JSON, so the substring tests need no spaced variants.
+    """
+    fresh = []
+    with open(path, "rb") as fh:
+        fh.seek(state["offset"])
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break          # half-written line; pick it up on the next pass
+            state["offset"] += len(raw)
+            if b'"type":"session"' in raw:
+                state["cwd"] = _json_get(raw, "cwd") or state["cwd"]
+            elif b'"type":"session_info"' in raw:
+                name = _json_get(raw, "name")
+                state["custom_title"] = (name.strip() or None
+                                         if isinstance(name, str) else None)
+            elif b'"type":"custom"' in raw and PI_COLOR_TYPE.encode() in raw:
+                entry = _json_line(raw) or {}
+                data = entry.get("data")
+                if (entry.get("customType") == PI_COLOR_TYPE
+                        and isinstance(data, dict)):
+                    state["color"] = data.get("color")
+            elif (state["prompt_chars"] < PROMPT_CAP
+                    and b'"role":"user"' in raw):
+                txt = _user_text(raw)
+                if txt:
+                    if state["first_prompt"] is None:
+                        state["first_prompt"] = txt
+                    fresh.append(txt)
+                    state["prompt_chars"] += len(txt)
+    if fresh:
+        state["prompts"] = " ".join(x for x in (state["prompts"], *fresh) if x)
+
+
+def parse_session(path, index=None, agent="claude"):
     """Build a Session from a .jsonl, reusing whatever the index already knows."""
     try:
         st = path.stat()
@@ -280,7 +349,7 @@ def parse_session(path, index=None):
         state = _blank_state()
     if state["offset"] < st.st_size:
         try:
-            _read_into(path, state)
+            (_read_pi_into if agent == "pi" else _read_into)(path, state)
         except OSError:
             return None
     if index is not None:
@@ -289,11 +358,15 @@ def parse_session(path, index=None):
     cwd = state["cwd"]
     if cwd is None:
         # Fall back to decoding the directory name (slashes were turned to '-').
-        cwd = "/" + path.parent.name.lstrip("-").replace("-", "/")
+        # Pi also wraps it in "--" on both ends.
+        cwd = "/" + path.parent.name.strip("-").replace("-", "/")
 
-    # A user's /rename (custom-title) wins over the auto-generated ai-title.
+    # A user's /rename (custom-title, or pi's /name) wins over the
+    # auto-generated ai-title.
     display_title = (state["custom_title"] or state["ai_title"]
                      or state["first_prompt"] or "(untitled session)")
+    # One line: a first prompt that opens with a heading would otherwise wrap.
+    display_title = " ".join(display_title.split())
     if len(display_title) > 90:
         display_title = display_title[:89] + "…"
 
@@ -304,14 +377,18 @@ def parse_session(path, index=None):
     blob = " ".join([state["custom_title"] or "", state["ai_title"] or "",
                      color or "", cwd, path.stem, state["prompts"]]).lower()
 
+    # Pi names its files <timestamp>_<uuid>; the uuid is the session id.
+    session_id = path.stem.split("_", 1)[-1] if agent == "pi" else path.stem
+
     return Session(
-        session_id=path.stem,
+        session_id=session_id,
         cwd=cwd,
         title=display_title,
         mtime=st.st_mtime,
         path=str(path),
         search_blob=blob,
         color=color,
+        agent=agent,
     )
 
 
@@ -379,13 +456,14 @@ class Index:
 def scan_sessions(index=None):
     sessions = []
     seen = set()
-    if not PROJECTS_DIR.is_dir():
-        return sessions
-    for jsonl in PROJECTS_DIR.glob("*/*.jsonl"):
-        seen.add(str(jsonl))
-        s = parse_session(jsonl, index)
-        if s is not None:
-            sessions.append(s)
+    for root, agent in SESSION_ROOTS:
+        if not root.is_dir():
+            continue
+        for jsonl in root.glob("*/*.jsonl"):
+            seen.add(str(jsonl))
+            s = parse_session(jsonl, index, agent)
+            if s is not None:
+                sessions.append(s)
     if index is not None:
         index.forget_missing(seen)
         index.save()
@@ -443,11 +521,55 @@ class Stars:
             pass
 
 
+def _pi_leaf_id(path):
+    """The id of the last entry in a pi session, or None if it has none yet.
+
+    Read backwards from the end, a block at a time: the last line can be a tool
+    result many times the size of one block.
+    """
+    with open(path, "rb") as fh:
+        pos = fh.seek(0, os.SEEK_END)
+        buf = b""
+        while pos > 0:
+            step = min(65536, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            lines = buf.rstrip(b"\n").split(b"\n")
+            # Unless we reached the start, the first piece may be cut mid-line.
+            for raw in reversed(lines if pos == 0 else lines[1:]):
+                entry = _json_line(raw)
+                if entry and entry.get("type") != "session" and entry.get("id"):
+                    return entry["id"]
+    return None
+
+
+def _pi_append(session, entry):
+    """Append an entry to a pi session the way pi itself does.
+
+    A pi log is a tree. Every entry names its parent, and the last one in the
+    file is the leaf that a resume continues from. Hanging the new entry off
+    that leaf keeps the conversation on one branch, which is what /name does.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    entry = {**entry,
+             "id": secrets.token_hex(4),
+             "parentId": _pi_leaf_id(session.path),
+             "timestamp": now.replace("+00:00", "Z")}
+    with open(session.path, "a") as fh:
+        fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
 def set_session_color(session, color):
     """Persist a colour by appending the same entry `/color` writes.
 
-    `/color default` clears it, and that is what passing None here does.
+    `/color default` clears it, and that is what passing None here does. Pi
+    has no /color, so a pi session gets a custom entry that only we read.
     """
+    if session.agent == "pi":
+        _pi_append(session, {"type": "custom", "customType": PI_COLOR_TYPE,
+                             "data": {"color": color}})
+        return
     entry = {"type": "agent-color",
              "agentColor": color or "default",
              "sessionId": session.session_id}
@@ -456,7 +578,11 @@ def set_session_color(session, color):
 
 
 def rename_session(session, new_title):
-    """Persist a custom name by appending the same entry `/rename` writes."""
+    """Persist a custom name by appending the same entry `/rename` writes, or
+    for a pi session the one `/name` writes."""
+    if session.agent == "pi":
+        _pi_append(session, {"type": "session_info", "name": new_title})
+        return
     entry = {"type": "custom-title",
              "customTitle": new_title,
              "sessionId": session.session_id}
@@ -636,11 +762,11 @@ def open_folder(path):
     return False
 
 
-def claude_bin():
+def agent_bin(agent):
     # On the host (incl. via flatpak-spawn) a login shell's PATH resolves it.
     if in_flatpak():
-        return "claude"
-    return shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        return agent
+    return shutil.which(agent) or os.path.expanduser(f"~/.local/bin/{agent}")
 
 
 # Per-terminal argv templates. {cwd} is filled in; the trailing entries are the
@@ -661,8 +787,8 @@ KNOWN_TERMINALS = [
 ]
 
 
-def open_terminal(cwd, claude_args):
-    """Open the user's default terminal in `cwd` running `claude claude_args`.
+def open_terminal(cwd, agent, agent_args):
+    """Open the user's default terminal in `cwd` running `agent agent_args`.
 
     Resolution order:
       1. $TERMINAL              (explicit user override)
@@ -671,8 +797,8 @@ def open_terminal(cwd, claude_args):
     """
     # Login shell so PATH/nvm/etc. are set up. cd explicitly (a flatpak-spawned
     # host process starts in $HOME, not our cwd), then drop to an interactive
-    # shell once Claude exits so the window stays open.
-    claude = " ".join([shlq(claude_bin()), *(shlq(a) for a in claude_args)])
+    # shell once the agent exits so the window stays open.
+    command = " ".join([shlq(agent_bin(agent)), *(shlq(a) for a in agent_args)])
     # Carry the ssh-agent across. Without this, git over SSH in the terminal we
     # open has no agent, so it prompts for a passphrase or refuses the key.
     # Export it in the command itself rather than through flatpak-spawn --env:
@@ -684,7 +810,7 @@ def open_terminal(cwd, claude_args):
         if sock:
             prelude = f"export SSH_AUTH_SOCK={shlq(sock)}; "
     shell_cmd = (f"{prelude}cd {shlq(cwd)} 2>/dev/null || cd; "
-                 f"{claude}; exec $SHELL")
+                 f"{command}; exec $SHELL")
     run_cmd = ["bash", "-lc", shell_cmd]
 
     candidates = []
@@ -726,17 +852,22 @@ def open_resume_terminal(session):
     cwd = session.cwd
     if not in_flatpak() and not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
-    return open_terminal(cwd, ["--resume", session.session_id])
+    if session.agent == "pi":
+        # Pi looks an id up among the current project's sessions only; the file
+        # itself works from anywhere, and the path is the same on the host.
+        return open_terminal(cwd, "pi", ["--session", session.path])
+    return open_terminal(cwd, "claude", ["--resume", session.session_id])
 
 
-def open_new_terminal(cwd, name):
+def open_new_terminal(cwd, name, agent="claude"):
     """Start a fresh session in `cwd`, optionally with a display name.
 
     `--name` is Claude Code's own flag for this, so the name shows up in the
     prompt box and the /resume picker, and lands in the session file as the same
-    custom title `/rename` writes — which is what this app reads back.
+    custom title `/rename` writes — which is what this app reads back. Pi has a
+    `--name` flag too, and it writes the session_info entry we read.
     """
-    return open_terminal(cwd, ["--name", name] if name else [])
+    return open_terminal(cwd, agent, ["--name", name] if name else [])
 
 
 def shlq(s):
@@ -768,6 +899,13 @@ class SessionRow(Adw.ActionRow):
         self._refresh_star_icon()
         self.star.connect("toggled", self._on_star_toggled)
         self.add_prefix(self.star)
+
+        # Which agent the session belongs to (suffix, so titles stay aligned).
+        text, _color = AGENT_BADGES[session.agent]
+        badge = Gtk.Label(label=text, valign=Gtk.Align.CENTER)
+        badge.add_css_class("agent-badge")
+        badge.add_css_class(session.agent)
+        self.add_suffix(badge)
 
         # Resume (suffix). Reference self.session so it stays correct if the
         # row's session is updated in place after a file change.
@@ -896,6 +1034,10 @@ class Window(Adw.ApplicationWindow):
         # Where the New session dialog starts from; follows the last one you
         # opened so a second session in the same project is a single click.
         self._last_location = str(Path.home())
+        # Which agent the New session dialog offers first, and whether pi is
+        # installed at all (asked of the host once, on first use).
+        self._last_agent = "claude"
+        self._has_pi = None
 
         toolbar = Adw.ToolbarView()
         self.set_content(toolbar)
@@ -940,6 +1082,16 @@ class Window(Adw.ApplicationWindow):
         content.set_margin_bottom(18)
         content.set_margin_start(12)
         content.set_margin_end(12)
+        # Agent filter. Only shown once there are sessions from both agents.
+        self.agent_filter = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
+        self.agent_filter.set_margin_bottom(6)
+        for name, label in (("all", "All"), *AGENTS):
+            self.agent_filter.add(Adw.Toggle(name=name, label=label))
+        self.agent_filter.set_active_name("all")
+        self.agent_filter.set_visible(False)
+        self.agent_filter.connect("notify::active-name",
+                                  lambda *_: self._filter())
+        content.append(self.agent_filter)
         # Two sections: starred favorites on top, everything else below.
         self.fav_header = self._section_header("Favorites")
         self.fav_listbox = self._make_list()
@@ -1022,27 +1174,34 @@ class Window(Adw.ApplicationWindow):
         if not self.all_rows:
             self.status.set_icon_name("dialog-information-symbolic")
             self.status.set_title("No sessions found")
-            self.status.set_description(f"Looked in {PROJECTS_DIR}")
+            self.status.set_description(self._looked_in())
             self.stack.set_visible_child_name("status")
             return False
 
         self.stack.set_visible_child_name("list")
+        agents = {r.session.agent for r in self.all_rows}
+        self.agent_filter.set_visible(len(agents) > 1)
         self.fav_listbox.invalidate_sort()   # re-order for any changed mtimes
         self.all_listbox.invalidate_sort()
         self._filter()                        # apply search + section visibility
         return False
 
-    # -- Live updates: watch ~/.claude/projects and diff on change ----------- #
+    @staticmethod
+    def _looked_in():
+        return "Looked in " + " and ".join(str(r) for r, _ in SESSION_ROOTS)
+
+    # -- Live updates: watch the session roots and diff on change ------------ #
     def _setup_monitor(self):
-        if not PROJECTS_DIR.is_dir():
-            return
-        self._watch_dir(Gio.File.new_for_path(str(PROJECTS_DIR)))
-        try:
-            for child in PROJECTS_DIR.iterdir():
-                if child.is_dir():
-                    self._watch_dir(Gio.File.new_for_path(str(child)))
-        except OSError:
-            pass
+        for root, _agent in SESSION_ROOTS:
+            if not root.is_dir():
+                continue
+            self._watch_dir(Gio.File.new_for_path(str(root)))
+            try:
+                for child in root.iterdir():
+                    if child.is_dir():
+                        self._watch_dir(Gio.File.new_for_path(str(child)))
+            except OSError:
+                pass
 
     def _watch_dir(self, gfile):
         path = gfile.get_path()
@@ -1101,14 +1260,16 @@ class Window(Adw.ApplicationWindow):
         self._update_sections()
 
     def _filter(self):
+        agent = self.agent_filter.get_active_name()
+        rows = [r for r in self.all_rows
+                if agent in (None, "all") or r.session.agent == agent]
         text = self.search.get_text()
-        if not text.split():
-            for row in self.all_rows:
-                row.set_visible(True)
-        else:
-            query = Query(text, [r.session for r in self.all_rows])
-            for row in self.all_rows:
-                row.set_visible(query.keeps(row.session))
+        if text.split():
+            query = Query(text, [r.session for r in rows])
+            rows = [r for r in rows if query.keeps(r.session)]
+        shown = set(rows)
+        for row in self.all_rows:
+            row.set_visible(row in shown)
         self._update_sections()
 
     def _update_sections(self):
@@ -1126,8 +1287,20 @@ class Window(Adw.ApplicationWindow):
 
     # -- New session --------------------------------------------------------- #
     def new_session(self):
-        """Ask for a name and a directory, then start Claude Code there."""
+        """Ask for a name and a directory, then start Claude Code (or pi)
+        there."""
+        if self._has_pi is None:
+            self._has_pi = host_has("pi")
         group = Adw.PreferencesGroup()
+        # Only offer a choice when there is one to make.
+        agent_row = None
+        if self._has_pi:
+            agent_row = Adw.ComboRow(
+                title="Agent",
+                model=Gtk.StringList.new([label for _, label in AGENTS]))
+            agent_row.set_selected(
+                [a for a, _ in AGENTS].index(self._last_agent))
+            group.add(agent_row)
         name_row = Adw.EntryRow(title="Name (optional)")
         loc_row = Adw.EntryRow(title="Location", text=self._last_location)
         browse = Gtk.Button(icon_name="folder-open-symbolic",
@@ -1184,12 +1357,18 @@ class Window(Adw.ApplicationWindow):
             # Enter in either field is "Start" (an EntryRow eats the keypress,
             # so the dialog's default response never sees it).
             dialog.close()
-            self._start_new_session(name_row.get_text(), loc_row.get_text())
+            self._start_new_session(name_row.get_text(), loc_row.get_text(),
+                                    selected_agent())
+
+        def selected_agent():
+            if agent_row is None:
+                return "claude"
+            return AGENTS[agent_row.get_selected()][0]
 
         name_row.connect("entry-activated", submit)
         loc_row.connect("entry-activated", submit)
         dialog.connect("response", self._on_new_session_response,
-                       name_row, loc_row)
+                       name_row, loc_row, selected_agent)
         dialog.present(self)
         name_row.grab_focus()
 
@@ -1223,11 +1402,13 @@ class Window(Adw.ApplicationWindow):
             return
         on_picked(path)
 
-    def _on_new_session_response(self, _dialog, response, name_row, loc_row):
+    def _on_new_session_response(self, _dialog, response, name_row, loc_row,
+                                 selected_agent):
         if response == "start":
-            self._start_new_session(name_row.get_text(), loc_row.get_text())
+            self._start_new_session(name_row.get_text(), loc_row.get_text(),
+                                    selected_agent())
 
-    def _start_new_session(self, name, location):
+    def _start_new_session(self, name, location, agent="claude"):
         name = name.strip()
         location = location.strip()
         if not location:
@@ -1247,7 +1428,7 @@ class Window(Adw.ApplicationWindow):
                     Adw.Toast(title=f"Couldn't create {cwd}: {err}"))
                 return
 
-        ok, term = open_new_terminal(cwd, name)
+        ok, term = open_new_terminal(cwd, name, agent)
         if not ok:
             self.toast.add_toast(
                 Adw.Toast(title="No supported terminal emulator found"))
@@ -1258,6 +1439,7 @@ class Window(Adw.ApplicationWindow):
         self._last_location = (os.path.dirname(cwd)
                                if slug and os.path.basename(cwd) == slug
                                else cwd)
+        self._last_agent = agent
         opened = "Created and started in" if created else "Starting in"
         self.toast.add_toast(Adw.Toast(title=f"{opened} {cwd} ({term})"))
 
@@ -1267,7 +1449,9 @@ class Window(Adw.ApplicationWindow):
         entry.set_margin_top(6)
         dialog = Adw.AlertDialog(
             heading="Rename session",
-            body="Set a custom name (as if you ran /rename in Claude Code).",
+            body=("Set a custom name (as if you ran /name in pi)."
+                  if row.session.agent == "pi" else
+                  "Set a custom name (as if you ran /rename in Claude Code)."),
         )
         dialog.set_extra_child(entry)
         dialog.add_response("cancel", "Cancel")
@@ -1334,7 +1518,7 @@ class Window(Adw.ApplicationWindow):
         if not self.all_rows:
             self.status.set_icon_name("dialog-information-symbolic")
             self.status.set_title("No sessions found")
-            self.status.set_description(f"Looked in {PROJECTS_DIR}")
+            self.status.set_description(self._looked_in())
             self.stack.set_visible_child_name("status")
         else:
             self._update_sections()

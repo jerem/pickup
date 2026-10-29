@@ -12,7 +12,9 @@ finish-args:
   - --device=dri
   # Read the session logs, and append a custom-title entry when renaming.
   - --filesystem=~/.claude
-  # Run the host terminal + `claude`/`gio trash` via flatpak-spawn --host.
+  # The same for pi sessions (a session_info entry when renaming).
+  - --filesystem=~/.pi/agent/sessions
+  # Run the host terminal + `claude`/`pi`/`gio trash` via flatpak-spawn --host.
   # (The sandbox can't see or exec host binaries directly.)
   - --talk-name=org.freedesktop.Flatpak
 
