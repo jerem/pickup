@@ -36,6 +36,8 @@ SESSION_ROOTS = ((PROJECTS_DIR, "claude"), (PI_SESSIONS_DIR, "pi"))
 PI_COLOR_TYPE = "pickup:color"
 # The agents a new session can start, as (command, label).
 AGENTS = (("claude", "Claude Code"), ("pi", "pi"))
+# The choices of the agent filter, as (name, label).
+AGENT_FILTERS = (("all", "All agents"), *AGENTS)
 # The badge each row carries to say which agent it belongs to: (text, colour).
 AGENT_BADGES = {"claude": ("Claude", "#c15f3c"), "pi": ("pi", "#3584e4")}
 APP_ID = "io.github.jerem.Pickup"
@@ -70,7 +72,17 @@ def session_css():
     """
     rules = [".color-swatch { min-width: 22px; min-height: 22px; padding: 0; }",
              ".agent-badge { font-size: smaller; font-weight: bold;"
-             " padding: 1px 8px; border-radius: 999px; }"]
+             " padding: 1px 8px; border-radius: 999px; }",
+             # The search box with the agent dropdown inside it: the box takes
+             # over the entry's background and focus ring.
+             ".search-bar { background-color: alpha(currentColor, 0.1);"
+             " border-radius: 6px; }",
+             ".search-bar:focus-within { outline: 2px solid"
+             " alpha(var(--accent-color), 0.5); outline-offset: -2px; }",
+             ".search-bar > entry { background: none; outline: none;"
+             " box-shadow: none; }",
+             ".search-bar > menubutton > button { min-height: 24px;"
+             " margin: 3px; padding: 0 6px; }"]
     for agent, (_text, value) in AGENT_BADGES.items():
         rules.append(f".agent-badge.{agent} {{ color: {value};"
                      f" background-color: alpha({value}, 0.15); }}")
@@ -1059,7 +1071,30 @@ class Window(Adw.ApplicationWindow):
         self.search.set_placeholder_text("Search title, directory, or content")
         self.search.set_hexpand(True)
         self.search.connect("search-changed", lambda *_: self._filter())
-        header.set_title_widget(self.search)
+
+        # Agent filter: a dropdown naming the agent shown, inside the search
+        # box since it narrows the same list. Only shown once there are
+        # sessions from both agents, since with one there is nothing to choose.
+        self.agent_action = Gio.SimpleAction.new_stateful(
+            "agent", GLib.VariantType.new("s"), GLib.Variant("s", "all"))
+        self.agent_action.connect("change-state", self._on_agent_changed)
+        self.add_action(self.agent_action)
+        menu = Gio.Menu()
+        for name, label in AGENT_FILTERS:
+            menu.append(label, f"win.agent::{name}")
+        self.agent_filter = Gtk.MenuButton(menu_model=menu,
+                                           always_show_arrow=True,
+                                           visible=False)
+        self.agent_filter.set_tooltip_text("Show sessions from")
+        self.agent_filter.add_css_class("flat")
+        self._refresh_agent_label()
+
+        # The box draws the field, so the entry and the dropdown read as one.
+        search_bar = Gtk.Box(hexpand=True)
+        search_bar.add_css_class("search-bar")
+        search_bar.append(self.search)
+        search_bar.append(self.agent_filter)
+        header.set_title_widget(search_bar)
 
         self.toast = Adw.ToastOverlay()
         toolbar.set_content(self.toast)
@@ -1082,16 +1117,6 @@ class Window(Adw.ApplicationWindow):
         content.set_margin_bottom(18)
         content.set_margin_start(12)
         content.set_margin_end(12)
-        # Agent filter. Only shown once there are sessions from both agents.
-        self.agent_filter = Adw.ToggleGroup(halign=Gtk.Align.CENTER)
-        self.agent_filter.set_margin_bottom(6)
-        for name, label in (("all", "All"), *AGENTS):
-            self.agent_filter.add(Adw.Toggle(name=name, label=label))
-        self.agent_filter.set_active_name("all")
-        self.agent_filter.set_visible(False)
-        self.agent_filter.connect("notify::active-name",
-                                  lambda *_: self._filter())
-        content.append(self.agent_filter)
         # Two sections: starred favorites on top, everything else below.
         self.fav_header = self._section_header("Favorites")
         self.fav_listbox = self._make_list()
@@ -1259,10 +1284,19 @@ class Window(Adw.ApplicationWindow):
             target.append(row)
         self._update_sections()
 
+    def _on_agent_changed(self, action, value):
+        action.set_state(value)
+        self._refresh_agent_label()
+        self._filter()
+
+    def _refresh_agent_label(self):
+        agent = self.agent_action.get_state().get_string()
+        self.agent_filter.set_label(dict(AGENT_FILTERS)[agent])
+
     def _filter(self):
-        agent = self.agent_filter.get_active_name()
+        agent = self.agent_action.get_state().get_string()
         rows = [r for r in self.all_rows
-                if agent in (None, "all") or r.session.agent == agent]
+                if agent == "all" or r.session.agent == agent]
         text = self.search.get_text()
         if text.split():
             query = Query(text, [r.session for r in rows])

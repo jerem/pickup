@@ -7,7 +7,7 @@ coding agent. It lists every Claude Code session found under
 working directory. One click resumes a session in a terminal, and you can start
 a new named session in any directory with either agent.
 
-Each row carries a badge naming its agent, and a switch above the list narrows
+Each row carries a badge naming its agent, and a dropdown inside the search box narrows
 it to one agent when you have sessions from both. Pi sessions resume with
 `pi --session <file>`, and renaming one appends the same `session_info` entry
 pi's `/name` writes. Pi has no session colour, so the app keeps it in a
