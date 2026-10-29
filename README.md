@@ -1,24 +1,23 @@
-# Claude Code Sessions
+# Pickup
 
-A small libadwaita/GTK4 dashboard that lists every Claude Code session found
-under `~/.claude/projects`, newest first, showing each session's title and
-working directory — and lets you resume any of them in a terminal with one
-click, or start a new named session in any directory.
+A small libadwaita/GTK4 dashboard for picking up where you left off with a
+coding agent. It lists every Claude Code session found under
+`~/.claude/projects` and every [pi](https://pi.dev) session under
+`~/.pi/agent/sessions`, newest first, showing each session's title, agent and
+working directory. One click resumes a session in a terminal, and you can start
+a new named session in any directory with either agent.
 
-It also lists [pi](https://pi.dev) sessions from `~/.pi/agent/sessions`. Each row
-carries a badge naming its agent, and a switch above the list narrows it to one
-agent when you have sessions from both. They resume with `pi --session <file>`, and renaming one
-appends the same `session_info` entry pi's `/name` writes. Pi has no session
-colour, so the app keeps it in a `custom` entry of its own, which pi leaves out
-of the model's context. The New session dialog offers pi as the agent when it
-is installed.
-
-![GTK4 / libadwaita]
+Each row carries a badge naming its agent, and a switch above the list narrows
+it to one agent when you have sessions from both. Pi sessions resume with
+`pi --session <file>`, and renaming one appends the same `session_info` entry
+pi's `/name` writes. Pi has no session colour, so the app keeps it in a
+`custom` entry of its own, which pi leaves out of the model's context. The New
+session dialog offers pi as the agent when it is installed.
 
 ## Run
 
 ```bash
-python3 claude_code_sessions.py
+python3 pickup.py
 ```
 
 Requires PyGObject with GTK 4 and libadwaita (`python3-gobject`, `gtk4`,
@@ -28,8 +27,8 @@ To install it as a launchable app, put the script on your `PATH` and copy the
 desktop file:
 
 ```bash
-install -Dm755 claude_code_sessions.py ~/.local/bin/claude-code-sessions
-cp io.github.jerem.ClaudeCodeSessions.desktop ~/.local/share/applications/
+install -Dm755 pickup.py ~/.local/bin/pickup
+cp io.github.jerem.Pickup.desktop ~/.local/share/applications/
 ```
 
 ## Flatpak
@@ -38,8 +37,8 @@ Build and install with `flatpak-builder` (needs `org.gnome.Sdk//50`):
 
 ```bash
 flatpak-builder --user --install --force-clean build-dir \
-    io.github.jerem.ClaudeCodeSessions.yaml
-flatpak run io.github.jerem.ClaudeCodeSessions
+    io.github.jerem.Pickup.yaml
+flatpak run io.github.jerem.Pickup
 ```
 
 The sandbox is intentionally narrow:
@@ -77,7 +76,7 @@ via `flatpak documents` on the host.
   before being parsed, so the big assistant payloads are never decoded.
 - **The index** — logs get large (a long session can reach hundreds of
   megabytes), and re-reading them all on every scan does not scale. Parsed state
-  is cached per file in `$XDG_CACHE_HOME/claude-code-sessions/index.json`,
+  is cached per file in `$XDG_CACHE_HOME/pickup/index.json`,
   including the byte offset parsing stopped at. Bumping its version discards
   what is cached, which is how a new field such as the session colour gets
   picked up for logs already indexed. Session logs are append-only, so

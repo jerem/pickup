@@ -1,8 +1,8 @@
-id: io.github.jerem.ClaudeCodeSessions
+id: io.github.jerem.Pickup
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
-command: claude-code-sessions
+command: pickup
 
 finish-args:
   # GUI
@@ -19,16 +19,16 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
 
 modules:
-  - name: claude-code-sessions
+  - name: pickup
     buildsystem: simple
     build-commands:
-      - install -Dm755 claude_code_sessions.py /app/bin/claude-code-sessions
-      - install -Dm644 io.github.jerem.ClaudeCodeSessions.desktop
-        /app/share/applications/io.github.jerem.ClaudeCodeSessions.desktop
-      - install -Dm644 io.github.jerem.ClaudeCodeSessions.metainfo.xml
-        /app/share/metainfo/io.github.jerem.ClaudeCodeSessions.metainfo.xml
-      - install -Dm644 io.github.jerem.ClaudeCodeSessions.svg
-        /app/share/icons/hicolor/scalable/apps/io.github.jerem.ClaudeCodeSessions.svg
+      - install -Dm755 pickup.py /app/bin/pickup
+      - install -Dm644 io.github.jerem.Pickup.desktop
+        /app/share/applications/io.github.jerem.Pickup.desktop
+      - install -Dm644 io.github.jerem.Pickup.metainfo.xml
+        /app/share/metainfo/io.github.jerem.Pickup.metainfo.xml
+      - install -Dm644 io.github.jerem.Pickup.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.jerem.Pickup.svg
     sources:
       - type: dir
         path: .

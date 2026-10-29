@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.jerem.ClaudeCodeSessions</id>
+  <id>io.github.jerem.Pickup</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <name>Claude Code Sessions</name>
-  <summary>Browse and resume your Claude Code sessions</summary>
+  <name>Pickup</name>
+  <summary>Resume your Claude Code and pi sessions</summary>
 
-  <url type="homepage">https://github.com/jerem/claude-code-sessions</url>
+  <url type="homepage">https://github.com/jerem/pickup</url>
   <developer id="io.github.jerem">
     <name>jerem</name>
   </developer>
@@ -14,11 +14,13 @@
   <description>
     <p>
       A small GTK4 / libadwaita dashboard that lists every Claude Code session
-      found under ~/.claude/projects, newest first, showing each session's title
+      found under ~/.claude/projects and every pi session under
+      ~/.pi/agent/sessions, newest first, showing each session's title, agent
       and working directory.
     </p>
     <p>Features:</p>
     <ul>
+      <li>Filter the list to one agent</li>
       <li>Search across session titles, working directories, and conversation content, forgiving typos</li>
       <li>Resume any session in your default terminal with one click</li>
       <li>Start a new named session in any directory, creating a folder from the name</li>
@@ -29,7 +31,7 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">io.github.jerem.ClaudeCodeSessions.desktop</launchable>
+  <launchable type="desktop-id">io.github.jerem.Pickup.desktop</launchable>
 
   <categories>
     <category>Development</category>
@@ -39,6 +41,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.1.0" date="2026-10-29">
+      <description>
+        <p>Renamed from Claude Code Sessions to Pickup, and lists pi sessions alongside Claude Code ones.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-06-29">
       <description>
         <p>Initial release.</p>

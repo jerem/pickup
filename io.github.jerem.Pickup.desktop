@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pickup
+Comment=Resume your Claude Code and pi sessions
+Exec=pickup
+Icon=io.github.jerem.Pickup
+Terminal=false
+Categories=Development;
+Keywords=claude;pi;agent;ai;terminal;session;resume;

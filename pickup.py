@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code Sessions — a small libadwaita/GTK4 dashboard.
+"""Pickup: a small libadwaita/GTK4 dashboard for coding agent sessions.
 
 Lists every Claude Code session found under ~/.claude/projects, and every pi
 session under ~/.pi/agent/sessions (newest first), shows its working directory,
@@ -33,19 +33,19 @@ PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 SESSION_ROOTS = ((PROJECTS_DIR, "claude"), (PI_SESSIONS_DIR, "pi"))
 # The entry we append to a pi session to remember its colour. Pi has no colour
 # of its own, and a plain custom entry is kept out of the model's context.
-PI_COLOR_TYPE = "claude-code-sessions:color"
+PI_COLOR_TYPE = "pickup:color"
 # The agents a new session can start, as (command, label).
 AGENTS = (("claude", "Claude Code"), ("pi", "pi"))
 # The badge each row carries to say which agent it belongs to: (text, colour).
 AGENT_BADGES = {"claude": ("Claude", "#c15f3c"), "pi": ("pi", "#3584e4")}
-APP_ID = "io.github.jerem.ClaudeCodeSessions"
+APP_ID = "io.github.jerem.Pickup"
 # Our own state (starred sessions). Maps to ~/.config outside the sandbox and to
 # ~/.var/app/<id>/config inside it — writable in both cases.
 STAR_PATH = (Path(GLib.get_user_config_dir())
-             / "claude-code-sessions" / "starred.json")
+             / "pickup" / "starred.json")
 # Parsed-session cache. Regenerable, so it lives in the cache dir.
 INDEX_PATH = (Path(GLib.get_user_cache_dir())
-              / "claude-code-sessions" / "index.json")
+              / "pickup" / "index.json")
 
 
 # The palette /color offers. "default" clears it, and anything we don't know
@@ -1021,7 +1021,7 @@ class SessionRow(Adw.ActionRow):
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app)
-        self.set_title("Claude Code Sessions")
+        self.set_title("Pickup")
         self.set_default_size(720, 760)
         self.all_rows = []
         self.rows_by_id = {}
