@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Pickup
-Comment=Resume your Claude Code and pi sessions
+Comment=Resume your coding agent sessions
 Exec=pickup
 Icon=io.github.jerem.Pickup
 Terminal=false
 Categories=Development;
-Keywords=claude;pi;agent;ai;terminal;session;resume;
+Keywords=claude;pi;opencode;agent;ai;terminal;session;resume;

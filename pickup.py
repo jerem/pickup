@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Pickup: a small libadwaita/GTK4 dashboard for coding agent sessions.
 
-Lists every Claude Code session found under ~/.claude/projects, and every pi
-session under ~/.pi/agent/sessions (newest first), shows its working directory,
-and lets you resume it in a terminal — or start a new named session in any
-directory.
+Lists every Claude Code session found under ~/.claude/projects, every pi
+session under ~/.pi/agent/sessions and every OpenCode session in its database
+(newest first), shows its working directory, and lets you resume it in a
+terminal, or start a new named session in any directory.
 """
 
 import json
@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -31,20 +32,39 @@ PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 # Where each agent keeps its logs, as (root, agent). Both lay them out the same
 # way: one directory per project, one .jsonl per session.
 SESSION_ROOTS = ((PROJECTS_DIR, "claude"), (PI_SESSIONS_DIR, "pi"))
+# OpenCode keeps its sessions in one SQLite database under the host's data
+# directory. Flatpak passes the host's XDG_DATA_HOME on as HOST_XDG_DATA_HOME,
+# and sets XDG_DATA_HOME itself to the app's own directory.
+_DATA_HOME = (os.environ.get("HOST_XDG_DATA_HOME")
+              if os.path.exists("/.flatpak-info")
+              else os.environ.get("XDG_DATA_HOME"))
+OPENCODE_DIR = Path(_DATA_HOME or Path.home() / ".local" / "share") / "opencode"
+OPENCODE_DB = OPENCODE_DIR / "opencode.db"
 # The entry we append to a pi session to remember its colour. Pi has no colour
 # of its own, and a plain custom entry is kept out of the model's context.
 PI_COLOR_TYPE = "pickup:color"
 # The agents a new session can start, as (command, label).
-AGENTS = (("claude", "Claude Code"), ("pi", "pi"))
+AGENTS = (("claude", "Claude Code"), ("pi", "pi"), ("opencode", "OpenCode"))
 # The choices of the agent filter, as (name, label).
 AGENT_FILTERS = (("all", "All agents"), *AGENTS)
+# What the rename dialog says it does, per agent.
+RENAME_HINTS = {
+    "claude": "Set a custom name (as if you ran /rename in Claude Code).",
+    "pi": "Set a custom name (as if you ran /name in pi).",
+    "opencode": "Set the session's title in OpenCode.",
+}
 # The badge each row carries to say which agent it belongs to: (text, colour).
-AGENT_BADGES = {"claude": ("Claude", "#c15f3c"), "pi": ("pi", "#3584e4")}
+AGENT_BADGES = {"claude": ("Claude", "#c15f3c"), "pi": ("pi", "#3584e4"),
+                "opencode": ("OpenCode", "#26a269")}
 APP_ID = "io.github.jerem.Pickup"
 # Our own state (starred sessions). Maps to ~/.config outside the sandbox and to
 # ~/.var/app/<id>/config inside it — writable in both cases.
 STAR_PATH = (Path(GLib.get_user_config_dir())
              / "pickup" / "starred.json")
+# Colours of OpenCode sessions. OpenCode has no session colour, and its
+# database is not ours to write to, so we keep them.
+COLORS_PATH = (Path(GLib.get_user_config_dir())
+               / "pickup" / "colors.json")
 # Parsed-session cache. Regenerable, so it lives in the cache dir.
 INDEX_PATH = (Path(GLib.get_user_cache_dir())
               / "pickup" / "index.json")
@@ -465,8 +485,85 @@ class Index:
         self._saved_at = time.monotonic()
 
 
-def scan_sessions(index=None):
+_OPENCODE_QUERY = """
+    SELECT s.id, s.title, s.directory, s.time_updated,
+           (SELECT group_concat(json_extract(m.data, '$.text'), ' ')
+              FROM (SELECT data FROM session_message
+                     WHERE session_id = s.id AND type = 'user'
+                     ORDER BY seq) AS m)
+      FROM session_v2 AS s
+     WHERE s.parent_id IS NULL AND s.time_archived IS NULL
+"""
+
+
+def scan_opencode():
+    """Every top-level OpenCode session, read from its database.
+
+    Opened read-only, and only the projection tables are read: the session
+    row for the title, directory and time, and the user turns for search.
+    Subagent sessions (those with a parent) and archived ones are left out,
+    as `opencode session list` does.
+    """
+    if not OPENCODE_DB.is_file():
+        return []
+    # Read-only first. That fails when the sandbox mounts the directory
+    # read-only and OpenCode is not running: a WAL database needs its -shm
+    # file, and we can't create it. With OpenCode stopped there is no -wal
+    # either, so the database file is complete and can be read as immutable.
+    for flags in ("mode=ro", "mode=ro&immutable=1"):
+        try:
+            con = sqlite3.connect(f"file:{OPENCODE_DB}?{flags}", uri=True,
+                                  timeout=2)
+            try:
+                rows = con.execute(_OPENCODE_QUERY).fetchall()
+            finally:
+                con.close()
+            break
+        except sqlite3.OperationalError:
+            continue        # read-only directory, or locked: try the next way
+        except sqlite3.Error:
+            return []       # a schema we don't know
+    else:
+        return []
     sessions = []
+    for sid, title, directory, updated, prompts in rows:
+        prompts = (prompts or "")[:PROMPT_CAP]
+        display = " ".join((title or prompts or "(untitled session)").split())
+        if len(display) > 90:
+            display = display[:89] + "…"
+        color = LOCAL_COLORS.get(sid)
+        blob = " ".join([title or "", color or "", directory or "", sid,
+                         prompts]).lower()
+        sessions.append(Session(
+            session_id=sid,
+            cwd=directory or str(Path.home()),
+            title=display,
+            mtime=(updated or 0) / 1000,
+            path=str(OPENCODE_DB),
+            search_blob=blob,
+            color=color,
+            agent="opencode",
+        ))
+    return sessions
+
+
+def _merge_copies(kept, other, kept_size, other_size):
+    """Pick which of two files holding the same session to show.
+
+    After a project moves, Claude Code can leave a second file with the same
+    id in the old project's directory, holding only metadata such as the
+    title and cost. The conversation is in the larger one, so that is the
+    session to resume. It takes the newer of the two times, so writes to
+    either still bring it to the top.
+    """
+    if other_size > kept_size:
+        kept, other = other, kept
+    kept.mtime = max(kept.mtime, other.mtime)
+    return kept
+
+
+def scan_sessions(index=None):
+    by_id = {}            # (agent, session id) -> (Session, file size)
     seen = set()
     for root, agent in SESSION_ROOTS:
         if not root.is_dir():
@@ -474,11 +571,23 @@ def scan_sessions(index=None):
         for jsonl in root.glob("*/*.jsonl"):
             seen.add(str(jsonl))
             s = parse_session(jsonl, index, agent)
-            if s is not None:
-                sessions.append(s)
+            if s is None:
+                continue
+            try:
+                size = jsonl.stat().st_size
+            except OSError:
+                continue
+            key = (agent, s.session_id)
+            if key in by_id:
+                kept, kept_size = by_id[key]
+                s = _merge_copies(kept, s, kept_size, size)
+                size = max(size, kept_size)
+            by_id[key] = (s, size)
     if index is not None:
         index.forget_missing(seen)
         index.save()
+    sessions = [s for s, _size in by_id.values()]
+    sessions.extend(scan_opencode())
     sessions.sort(key=lambda s: s.mtime, reverse=True)
     return sessions
 
@@ -533,6 +642,38 @@ class Stars:
             pass
 
 
+class LocalColors:
+    """Session colours we keep ourselves, for agents with nowhere to put one.
+
+    A small JSON object of session id -> colour name, like the stars.
+    """
+
+    def __init__(self):
+        self.colors = {}
+        try:
+            data = json.loads(COLORS_PATH.read_text())
+            if isinstance(data, dict):
+                self.colors = data
+        except (OSError, ValueError):
+            pass
+
+    def get(self, session_id):
+        return self.colors.get(session_id)
+
+    def set(self, session_id, color):
+        if color:
+            self.colors[session_id] = color
+        else:
+            self.colors.pop(session_id, None)
+        COLORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COLORS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.colors, sort_keys=True))
+        tmp.replace(COLORS_PATH)      # atomic swap
+
+
+LOCAL_COLORS = LocalColors()
+
+
 def _pi_leaf_id(path):
     """The id of the last entry in a pi session, or None if it has none yet.
 
@@ -577,7 +718,12 @@ def set_session_color(session, color):
 
     `/color default` clears it, and that is what passing None here does. Pi
     has no /color, so a pi session gets a custom entry that only we read.
+    OpenCode has none either, and we don't write to its database, so its
+    colours stay with us.
     """
+    if session.agent == "opencode":
+        LOCAL_COLORS.set(session.session_id, color)
+        return
     if session.agent == "pi":
         _pi_append(session, {"type": "custom", "customType": PI_COLOR_TYPE,
                              "data": {"color": color}})
@@ -591,7 +737,14 @@ def set_session_color(session, color):
 
 def rename_session(session, new_title):
     """Persist a custom name by appending the same entry `/rename` writes, or
-    for a pi session the one `/name` writes."""
+    for a pi session the one `/name` writes. OpenCode keeps sessions in a
+    database its server owns, so ask the server to change the title."""
+    if session.agent == "opencode":
+        run_agent_on_host(
+            "opencode", ["api", "session.update",
+                         "--param", f"sessionID={session.session_id}",
+                         "-d", json.dumps({"title": new_title})])
+        return
     if session.agent == "pi":
         _pi_append(session, {"type": "session_info", "name": new_title})
         return
@@ -644,8 +797,9 @@ def host_env(var):
 def host_isdir(path):
     """Does `path` exist as a directory where the terminal will be launched?
 
-    Always ask the host when sandboxed: we only mount ~/.claude, so a project
-    directory reads as missing from in here even when it is really there.
+    Always ask the host when sandboxed: we only mount the session logs, so a
+    project directory reads as missing from in here even when it is really
+    there.
     """
     if in_flatpak():
         try:
@@ -663,7 +817,7 @@ def host_mkdir(path):
     """Create `path` and any missing parents on the host.
 
     Returns None on success, else a message. Done host-side for the same reason
-    as host_isdir: the sandbox can't write outside ~/.claude, but the host
+    as host_isdir: the sandbox can't write outside the session logs, but the host
     process we're allowed to spawn can.
     """
     if in_flatpak():
@@ -781,6 +935,40 @@ def agent_bin(agent):
     return shutil.which(agent) or os.path.expanduser(f"~/.local/bin/{agent}")
 
 
+def run_agent_on_host(agent, args, timeout=60):
+    """Run an agent's CLI to completion where the terminal would run it.
+
+    Through a login shell, like the terminal: agents installed with npm or
+    into ~/.local/bin are often only on the PATH a login shell sets up.
+    Raises OSError carrying the agent's own message when it fails.
+    """
+    command = " ".join([shlq(agent_bin(agent)), *(shlq(a) for a in args)])
+    argv = ["bash", "-lc", command]
+    if in_flatpak():
+        argv = ["flatpak-spawn", "--host", *argv]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"{agent} did not answer") from exc
+    if r.returncode != 0:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        raise OSError(lines[-1] if lines else f"{agent} failed")
+
+
+def host_has_agent(agent):
+    """Is `agent` installed where the terminal runs it? Asked of a login
+    shell, for the same reason as run_agent_on_host."""
+    argv = ["bash", "-lc", f"command -v {shlq(agent)}"]
+    if in_flatpak():
+        argv = ["flatpak-spawn", "--host", *argv]
+    try:
+        return subprocess.run(argv, capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 # Per-terminal argv templates. {cwd} is filled in; the trailing entries are the
 # command to run. Only used as a fallback when no system default is configured.
 KNOWN_TERMINALS = [
@@ -857,8 +1045,8 @@ def open_terminal(cwd, agent, agent_args):
 def open_resume_terminal(session):
     """Resume an existing session in a terminal."""
     # Don't validate the session's cwd with os.path.isdir() when sandboxed: the
-    # Flatpak only mounts ~/.claude, so project dirs read as missing and we'd
-    # fall back to $HOME — where `claude --resume` can't find the session. The
+    # Flatpak only mounts the session logs, so project dirs read as missing and
+    # we'd fall back to $HOME — where `claude --resume` can't find the session. The
     # dir exists on the host, so trust it and let the host shell fall back if
     # it's genuinely gone.
     cwd = session.cwd
@@ -868,6 +1056,8 @@ def open_resume_terminal(session):
         # Pi looks an id up among the current project's sessions only; the file
         # itself works from anywhere, and the path is the same on the host.
         return open_terminal(cwd, "pi", ["--session", session.path])
+    if session.agent == "opencode":
+        return open_terminal(cwd, "opencode", ["--session", session.session_id])
     return open_terminal(cwd, "claude", ["--resume", session.session_id])
 
 
@@ -877,9 +1067,13 @@ def open_new_terminal(cwd, name, agent="claude"):
     `--name` is Claude Code's own flag for this, so the name shows up in the
     prompt box and the /resume picker, and lands in the session file as the same
     custom title `/rename` writes — which is what this app reads back. Pi has a
-    `--name` flag too, and it writes the session_info entry we read.
+    `--name` flag too, and it writes the session_info entry we read. OpenCode
+    has no such flag and titles a session itself, so there the name only
+    names the folder.
     """
-    return open_terminal(cwd, agent, ["--name", name] if name else [])
+    if agent == "opencode" or not name:
+        return open_terminal(cwd, agent, [])
+    return open_terminal(cwd, agent, ["--name", name])
 
 
 def shlq(s):
@@ -1046,10 +1240,10 @@ class Window(Adw.ApplicationWindow):
         # Where the New session dialog starts from; follows the last one you
         # opened so a second session in the same project is a single click.
         self._last_location = str(Path.home())
-        # Which agent the New session dialog offers first, and whether pi is
-        # installed at all (asked of the host once, on first use).
+        # Which agent the New session dialog offers first, and which agents
+        # are installed (asked of the host once, on first use).
         self._last_agent = "claude"
-        self._has_pi = None
+        self._installed = None
 
         toolbar = Adw.ToolbarView()
         self.set_content(toolbar)
@@ -1213,7 +1407,8 @@ class Window(Adw.ApplicationWindow):
 
     @staticmethod
     def _looked_in():
-        return "Looked in " + " and ".join(str(r) for r, _ in SESSION_ROOTS)
+        places = [str(r) for r, _ in SESSION_ROOTS] + [str(OPENCODE_DB)]
+        return "Looked in " + ", ".join(places)
 
     # -- Live updates: watch the session roots and diff on change ------------ #
     def _setup_monitor(self):
@@ -1227,6 +1422,22 @@ class Window(Adw.ApplicationWindow):
                         self._watch_dir(Gio.File.new_for_path(str(child)))
             except OSError:
                 pass
+        # OpenCode's database: the directory, since a write lands in the
+        # -wal file next to it rather than in the database itself.
+        if OPENCODE_DIR.is_dir():
+            try:
+                monitor = Gio.File.new_for_path(
+                    str(OPENCODE_DIR)).monitor_directory(
+                        Gio.FileMonitorFlags.NONE, None)
+            except GLib.Error:
+                return
+            monitor.connect("changed", self._on_opencode_changed)
+            self._monitors.append(monitor)
+
+    def _on_opencode_changed(self, _monitor, gfile, _other, _event):
+        # Its logs and snapshots live in the same directory and churn.
+        if (gfile.get_basename() or "").startswith(OPENCODE_DB.name):
+            self._schedule_rescan()
 
     def _watch_dir(self, gfile):
         path = gfile.get_path()
@@ -1321,19 +1532,22 @@ class Window(Adw.ApplicationWindow):
 
     # -- New session --------------------------------------------------------- #
     def new_session(self):
-        """Ask for a name and a directory, then start Claude Code (or pi)
-        there."""
-        if self._has_pi is None:
-            self._has_pi = host_has("pi")
+        """Ask for a name and a directory, then start an agent there."""
+        if self._installed is None:
+            # Claude Code is always offered: it is what the app is built on.
+            self._installed = [(a, label) for a, label in AGENTS
+                               if a == "claude" or host_has_agent(a)]
+        installed = self._installed
         group = Adw.PreferencesGroup()
         # Only offer a choice when there is one to make.
         agent_row = None
-        if self._has_pi:
+        if len(installed) > 1:
             agent_row = Adw.ComboRow(
                 title="Agent",
-                model=Gtk.StringList.new([label for _, label in AGENTS]))
-            agent_row.set_selected(
-                [a for a, _ in AGENTS].index(self._last_agent))
+                model=Gtk.StringList.new([label for _, label in installed]))
+            names = [a for a, _ in installed]
+            if self._last_agent in names:
+                agent_row.set_selected(names.index(self._last_agent))
             group.add(agent_row)
         name_row = Adw.EntryRow(title="Name (optional)")
         loc_row = Adw.EntryRow(title="Location", text=self._last_location)
@@ -1397,7 +1611,7 @@ class Window(Adw.ApplicationWindow):
         def selected_agent():
             if agent_row is None:
                 return "claude"
-            return AGENTS[agent_row.get_selected()][0]
+            return installed[agent_row.get_selected()][0]
 
         name_row.connect("entry-activated", submit)
         loc_row.connect("entry-activated", submit)
@@ -1411,7 +1625,7 @@ class Window(Adw.ApplicationWindow):
         start = os.path.expanduser(current.strip() or "~")
         # Open at the nearest existing ancestor, so browsing still works while a
         # not-yet-created path sits in the field. Ask the host: project dirs
-        # aren't visible in here (we mount only ~/.claude).
+        # aren't visible in here (we mount only the session logs).
         while start != "/" and not host_isdir(start):
             start = os.path.dirname(start)
         chooser.set_initial_folder(Gio.File.new_for_path(start))
@@ -1483,9 +1697,7 @@ class Window(Adw.ApplicationWindow):
         entry.set_margin_top(6)
         dialog = Adw.AlertDialog(
             heading="Rename session",
-            body=("Set a custom name (as if you ran /name in pi)."
-                  if row.session.agent == "pi" else
-                  "Set a custom name (as if you ran /rename in Claude Code)."),
+            body=RENAME_HINTS[row.session.agent],
         )
         dialog.set_extra_child(entry)
         dialog.add_response("cancel", "Cancel")
@@ -1516,7 +1728,10 @@ class Window(Adw.ApplicationWindow):
         dialog = Adw.AlertDialog(
             heading="Delete session?",
             body=(f"“{session.title}”\n{session.cwd}\n\n"
-                  "The session file will be moved to the trash."),
+                  + ("OpenCode deletes it for good, with any subagent "
+                     "sessions. It has no trash."
+                     if session.agent == "opencode" else
+                     "The session file will be moved to the trash.")),
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("delete", "Delete")
@@ -1531,6 +1746,16 @@ class Window(Adw.ApplicationWindow):
         if response != "delete":
             return
         session = row.session
+        if session.agent == "opencode":
+            try:
+                run_agent_on_host("opencode",
+                                  ["session", "delete", session.session_id])
+            except OSError as exc:
+                self.toast.add_toast(
+                    Adw.Toast(title=f"Couldn't delete: {exc}"))
+                return
+            self._drop_row(row, "Session deleted")
+            return
         try:
             if in_flatpak():
                 # The sandbox has no trash backend; trash on the host where the
@@ -1543,12 +1768,17 @@ class Window(Adw.ApplicationWindow):
         except GLib.Error as exc:
             self.toast.add_toast(Adw.Toast(title=f"Couldn't delete: {exc.message}"))
             return
+        self._drop_row(row, "Session moved to trash")
+
+    def _drop_row(self, row, message):
+        """Take a deleted session's row out of the list, and say so."""
         parent = row.get_parent()
         if parent is not None:
             parent.remove(row)
         if row in self.all_rows:
             self.all_rows.remove(row)
-        self.toast.add_toast(Adw.Toast(title="Session moved to trash"))
+        self.rows_by_id.pop(row.session.session_id, None)
+        self.toast.add_toast(Adw.Toast(title=message))
         if not self.all_rows:
             self.status.set_icon_name("dialog-information-symbolic")
             self.status.set_title("No sessions found")

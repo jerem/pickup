@@ -11,10 +11,14 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   # Read the session logs, and append a custom-title entry when renaming.
-  - --filesystem=~/.claude
+  # Only the logs: the rest of ~/.claude holds Claude Code's credentials.
+  - --filesystem=~/.claude/projects
   # The same for pi sessions (a session_info entry when renaming).
   - --filesystem=~/.pi/agent/sessions
-  # Run the host terminal + `claude`/`pi`/`gio trash` via flatpak-spawn --host.
+  # OpenCode's session database, read-only: renames and deletes go through
+  # OpenCode's own CLI on the host, so nothing here writes to it.
+  - --filesystem=xdg-data/opencode:ro
+  # Run the host terminal + the agents + `gio trash` via flatpak-spawn --host.
   # (The sandbox can't see or exec host binaries directly.)
   - --talk-name=org.freedesktop.Flatpak
 
